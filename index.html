@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DXF Quick Viewer v0.72 (Fix)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; color: #fff; font-family: sans-serif; }
+        #header {
+            position: absolute; top: 0; left: 0; width: 100%;
+            background: rgba(30, 30, 30, 0.9); padding: 10px;
+            display: flex; gap: 10px; align-items: center; z-index: 10; flex-wrap: wrap;
+        }
+        h1 { margin: 0 20px 0 0; font-size: 18px; white-space: nowrap; }
+        input[type=file] { display: none; }
+        button, select {
+            padding: 5px 15px; background: #444; color: #fff; border: 1px solid #666; cursor: pointer; font-size: 14px;
+        }
+        button:hover, select:hover { background: #666; }
+        #status { margin-left: auto; font-size: 12px; color: #aaa; margin-right: 20px; white-space: nowrap;}
+        #log-console {
+            position: absolute; bottom: 0; left: 0; width: 100%; height: 120px;
+            background: rgba(0,0,0,0.7); overflow-y: scroll; font-size: 11px; padding: 5px; pointer-events: none; font-family: monospace; z-index: 5;
+        }
+        #layer-panel {
+            position: absolute; top: 60px; right: 10px; width: 250px; max-height: calc(100vh - 200px);
+            background: rgba(30, 30, 30, 0.9); border: 1px solid #555; overflow-y: auto; display: none; flex-direction: column; padding: 10px; z-index: 20;
+        }
+        .layer-item { display: flex; align-items: center; font-size: 12px; padding: 2px 0; }
+        .layer-item input { margin-right: 8px; }
+        .layer-header { font-weight: bold; margin-bottom: 5px; display: flex; justify-content: space-between; }
+        .close-btn { background: none; border: none; font-size: 16px; cursor: pointer; color: #aaa; padding: 0;}
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <!-- PWA Settings -->
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" type="image/png" href="icon-192.png">
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('service-worker.js');
+        }
+    </script>
+</head>
+<body>
+
+<div id="header">
+    <h1>DXF Quick Viewer v0.72</h1>
+    <input type="file" id="file-input" accept=".dxf">
+    <button onclick="document.getElementById('file-input').click()">📂 Open DXF</button>
+    <select id="encoding-select"><option value="Shift_JIS" selected>Shift_JIS</option><option value="UTF-8">UTF-8</option></select>
+    <button onclick="fitCamera()">🔍 Fit</button>
+    <button onclick="toggleLayerPanel()">Layers</button>
+    <button onclick="toggleBackground()">🎨 BG</button>
+    <button onclick="exportSimpleDXF()" style="background:#28a745;">💾 Export Simple DXF</button>
+    <button onclick="clearScene()">🗑️ Clear</button>
+    <div id="status">Ready</div>
+</div>
+
+<div id="layer-panel">
+    <div class="layer-header">Layers <button class="close-btn" onclick="toggleLayerPanel()">×</button></div>
+    <div id="layer-list"></div>
+</div>
+<div id="log-console"></div>
+
+<script>
+    let scene, camera, renderer, controls;
+    let dxfGroup;
+    let isWhiteBg = false;
+    const lineMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 1 });
+    const lineMaterialDark = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1 });
+    
+    let entityStats = {};
+    let ignoredStats = {};
+    let layers = {};
+    
+    // This will store the flattened geometry data for export
+    let flatEntities = []; 
+
+    const CURVE_SEGMENTS = 32; 
+
+    init();
+
+    function init() {
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+        camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1e10);
+        camera.position.set(0, 0, 1000);
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+        
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.1;
+        controls.enableRotate = false; 
+        controls.screenSpacePanning = true;
+        controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+        
+        const grid = new THREE.GridHelper(10000, 100, 0x444444, 0x222222);
+        grid.rotation.x = Math.PI / 2; 
+        grid.name = "Grid";
+        scene.add(grid);
+        
+        dxfGroup = new THREE.Group();
+        scene.add(dxfGroup);
+
+        window.addEventListener('resize', onResize);
+        document.getElementById('file-input').addEventListener('change', handleFile);
+        animate();
+    }
+
+    function onResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+
+    function toggleBackground() {
+        isWhiteBg = !isWhiteBg;
+        scene.background = new THREE.Color(isWhiteBg ? 0xf0f0f0 : 0x000000);
+        const grid = scene.getObjectByName("Grid");
+        if(grid) grid.visible = !isWhiteBg;
+        dxfGroup.traverse(child => {
+            if (child.isLine || child.isLineLoop || child.isLineSegments) {
+                child.material = isWhiteBg ? lineMaterialDark : lineMaterial;
+            }
+        });
+    }
+
+    function toggleLayerPanel() {
+        const p = document.getElementById('layer-panel');
+        p.style.display = (p.style.display === 'flex') ? 'none' : 'flex';
+    }
+
+    function handleFile(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        
+        const encoding = document.getElementById('encoding-select').value;
+        document.getElementById('status').innerText = "Loading...";
+        logToScreen(`Reading file: ${file.name} (${encoding})...`);
+        
+        entityStats = {};
+        ignoredStats = {};
+        layers = {};
+        flatEntities = []; // Reset export data
+        document.getElementById('layer-list').innerHTML = ''; 
+
+        const reader = new FileReader();
+        
+        reader.onload = (re) => {
+            try {
+                // Use setTimeout to allow UI to update to "Loading..." before heavy parsing freezes it
+                setTimeout(() => {
+                    try {
+                        const data = parseDXF(re.target.result);
+                        renderDXF(data);
+                        buildLayerUI(data.layers);
+                        document.getElementById('status').innerText = `${file.name} - Loaded`;
+                        logToScreen(`Entities: ${JSON.stringify(entityStats)}`);
+                        fitCamera();
+                    } catch (parseErr) {
+                        console.error(parseErr);
+                        document.getElementById('status').innerText = "Parse Error";
+                        logToScreen("Parse Error: " + parseErr.message);
+                    }
+                }, 50);
+            } catch (err) {
+                console.error(err);
+                document.getElementById('status').innerText = "Error";
+                logToScreen("Error: " + err.message);
+            }
+        };
+        
+        reader.readAsText(file, encoding);
+        e.target.value = '';
+    }
+
+    function clearScene() {
+        for (let i = dxfGroup.children.length - 1; i >= 0; i--) {
+            const obj = dxfGroup.children[i];
+            dxfGroup.remove(obj);
+            if(obj.geometry) obj.geometry.dispose();
+        }
+        flatEntities = [];
+    }
+
+    function logToScreen(msg) {
+        const con = document.getElementById('log-console');
+        const d = document.createElement('div');
+        d.textContent = `> ${msg}`;
+        con.appendChild(d);
+        con.scrollTop = con.scrollHeight;
+    }
+
+    // --- DXF Parser ---
+    function parseDXF(text) {
+        const lines = text.replace(/\r\n/g, '\n').split('\n');
+        let currentSection = null;
+        let currentBlock = null;
+        let currentEntity = null;
+        const blocks = {}; 
+        const entities = []; 
+        const layers = {}; 
+        const supported = ['LINE', 'CIRCLE', 'ARC', 'LWPOLYLINE', 'INSERT', 'SPLINE', 'POLYLINE', 'VERTEX', 'SEQEND', 'ELLIPSE', 'DIMENSION', 'SOLID', '3DFACE', 'POINT', 'TEXT'];
+
+        const commitEntity = () => {
+            if (!currentEntity) return;
+            // Register layer
+            if (currentEntity.layer) layers[currentEntity.layer] = true;
+            else { currentEntity.layer = '0'; layers['0'] = true; }
+
+            if (currentSection === 'BLOCKS' && currentBlock) {
+                currentBlock.entities.push(currentEntity);
+            } else if (currentSection === 'ENTITIES') {
+                entities.push(currentEntity);
+            }
+        };
+
+        for (let i = 0; i < lines.length; i++) {
+            const code = lines[i].trim();
+            const value = (lines[i+1] || "").trim();
+            i++; 
+
+            if (code === '0') {
+                if (value !== 'VERTEX' && value !== 'SEQEND') {
+                    if (currentEntity && currentEntity.type !== 'POLYLINE') {
+                        commitEntity();
+                        currentEntity = null;
+                    } else if (currentEntity && currentEntity.type === 'POLYLINE' && value === 'ENDSEC') {
+                        commitEntity();
+                        currentEntity = null;
+                    }
+                }
+
+                if (value === 'SECTION') {
+                    currentSection = null; 
+                } else if (value === 'ENDSEC') {
+                    currentSection = null;
+                } else if (value === 'BLOCK') {
+                    currentBlock = { name: '', entities: [] };
+                    currentEntity = null; 
+                } else if (value === 'ENDBLK') {
+                    if (currentBlock && currentBlock.name) blocks[currentBlock.name] = currentBlock.entities;
+                    currentBlock = null;
+                } else if (supported.includes(value)) {
+                    if (value === 'VERTEX') {
+                        let parentList = (currentSection === 'BLOCKS' && currentBlock) ? currentBlock.entities : entities;
+                        let parent = currentEntity; 
+                        if (!parent && parentList.length > 0) parent = parentList[parentList.length-1]; // Attempt attach
+
+                        if (parent && parent.type === 'POLYLINE') {
+                            if (!parent.vertices) parent.vertices = [];
+                            commitEntity(); 
+                            currentEntity = { type: 'VERTEX', parentPolyline: parent };
+                        }
+                    } else if (value === 'SEQEND') {
+                         if (currentEntity && (currentEntity.type === 'VERTEX' || currentEntity.type === 'POLYLINE')) {
+                             commitEntity();
+                             currentEntity = null;
+                         }
+                    } else {
+                        commitEntity(); 
+                        currentEntity = { type: value };
+                        entityStats[value] = (entityStats[value] || 0) + 1;
+                    }
+                } else {
+                    commitEntity();
+                    currentEntity = null;
+                }
+            } else if (code === '2') {
+                if (value === 'BLOCKS') currentSection = 'BLOCKS';
+                else if (value === 'ENTITIES') currentSection = 'ENTITIES';
+                else if (currentBlock && !currentBlock.name && currentSection === 'BLOCKS') currentBlock.name = value;
+                else if (currentEntity && (currentEntity.type === 'INSERT' || currentEntity.type === 'DIMENSION')) {
+                    currentEntity.blockName = value;
+                }
+            } else if (currentEntity) {
+                const val = parseFloat(value);
+                if (code === '8') currentEntity.layer = value; 
+                if (code === '10') currentEntity.x = val;
+                if (code === '20') currentEntity.y = val;
+                if (code === '30') currentEntity.z = val;
+                if (code === '11') currentEntity.x2 = val;
+                if (code === '21') currentEntity.y2 = val;
+                if (code === '41') currentEntity.xScale = val;
+                if (code === '42') currentEntity.yScale = val; 
+                if (code === '50') {
+                    if(currentEntity.type === 'INSERT') currentEntity.rotation = val; 
+                    else currentEntity.startAngle = val * Math.PI / 180;
+                }
+                if (code === '51') currentEntity.endAngle = val * Math.PI / 180;
+                if (code === '40') currentEntity.r = val; 
+                if (code === '1') currentEntity.text = value; // Text content
+
+                if (currentEntity.type === 'SPLINE' || currentEntity.type === 'LWPOLYLINE') {
+                    if (currentEntity.type === 'SPLINE') {
+                        if (!currentEntity.controlPoints) currentEntity.controlPoints = [];
+                        if (code === '10') currentEntity.controlPoints.push({ x: val, y: 0, z: 0 });
+                        if (code === '20') { let cp = currentEntity.controlPoints[currentEntity.controlPoints.length - 1]; if (cp) cp.y = val; }
+                        if (code === '30') { let cp = currentEntity.controlPoints[currentEntity.controlPoints.length - 1]; if (cp) cp.z = val; }
+                    }
+                    if (currentEntity.type === 'LWPOLYLINE') {
+                        if (!currentEntity.vertices) currentEntity.vertices = [];
+                        if (code === '10') currentEntity.vertices.push({ x: val, y: 0, z: 0 });
+                        if (code === '20') { let v = currentEntity.vertices[currentEntity.vertices.length - 1]; if (v) v.y = val; }
+                    }
+                }
+            }
+        }
+        commitEntity();
+        return { entities, blocks, layers };
+    }
+
+    function renderDXF(data) {
+        clearScene();
+        let count = 0;
+        
+        // IMPORTANT: Reset flatEntities here
+        flatEntities = [];
+
+        function drawEntity(e, parentMatrix, parentLayer) {
+            const points = [];
+            const applyMatrix = (v) => {
+                if (parentMatrix) v.applyMatrix4(parentMatrix);
+                return v;
+            };
+
+            const mat = isWhiteBg ? lineMaterialDark : lineMaterial;
+            
+            let layer = e.layer || '0';
+            if (layer === '0' && parentLayer) {
+                layer = parentLayer;
+            }
+
+            // --- Capture for Export ---
+            // Store simple representation in flatEntities
+            const recordFlat = (item) => {
+                item.layer = layer;
+                item.visible = true; // Default visible
+                flatEntities.push(item);
+            };
+
+            if (e.type === 'LINE') {
+                if (e.x != null && e.y != null && e.x2 != null && e.y2 != null) {
+                    const p1 = applyMatrix(new THREE.Vector3(e.x, e.y, e.z || 0));
+                    const p2 = applyMatrix(new THREE.Vector3(e.x2, e.y2, e.z2 || 0));
+                    points.push(p1); points.push(p2);
+                    
+                    recordFlat({ type: 'LINE', x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y });
+                }
+            } else if (e.type === 'CIRCLE') {
+                if (e.x != null && e.y != null && e.r != null) {
+                    const center = applyMatrix(new THREE.Vector3(e.x, e.y, 0));
+                    // Approx scale for radius from matrix scale
+                    let scale = 1.0;
+                    if (parentMatrix) {
+                        const s = new THREE.Vector3();
+                        parentMatrix.decompose(new THREE.Vector3(), new THREE.Quaternion(), s);
+                        scale = s.x; // Use X scale
+                    }
+                    const r = e.r * Math.abs(scale);
+                    
+                    const curve = new THREE.EllipseCurve(center.x, center.y, r, r, 0, 2*Math.PI, false, 0);
+                    const curvePoints = curve.getPoints(CURVE_SEGMENTS).map(p => new THREE.Vector3(p.x, p.y, 0));
+                    curvePoints.forEach(p => points.push(p));
+                    
+                    recordFlat({ type: 'CIRCLE', cx: center.x, cy: center.y, r: r });
+                }
+            } else if (e.type === 'ARC') {
+                 if (e.x != null && e.y != null && e.r != null) {
+                    const center = applyMatrix(new THREE.Vector3(e.x, e.y, 0));
+                    let scale = 1.0;
+                    let rotationOffset = 0;
+                    if (parentMatrix) {
+                        const s = new THREE.Vector3();
+                        const q = new THREE.Quaternion();
+                        parentMatrix.decompose(new THREE.Vector3(), q, s);
+                        scale = s.x;
+                        const euler = new THREE.Euler().setFromQuaternion(q);
+                        rotationOffset = euler.z;
+                    }
+                    const r = e.r * Math.abs(scale);
+                    const start = (e.startAngle || 0) + rotationOffset;
+                    const end = (e.endAngle || 0) + rotationOffset;
+
+                    const curve = new THREE.EllipseCurve(center.x, center.y, r, r, start, end, false, 0);
+                    const curvePoints = curve.getPoints(CURVE_SEGMENTS).map(p => new THREE.Vector3(p.x, p.y, 0));
+                    curvePoints.forEach(p => points.push(p));
+                    
+                    recordFlat({ type: 'ARC', cx: center.x, cy: center.y, r: r, startAngle: start, endAngle: end });
+                 }
+            } else if (e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') {
+                if(e.vertices && e.vertices.length > 0) {
+                    const verts = [];
+                    e.vertices.forEach(v => {
+                        if(v.x != null && v.y != null) {
+                            const p = applyMatrix(new THREE.Vector3(v.x, v.y, 0));
+                            points.push(p);
+                            verts.push({ x: p.x, y: p.y });
+                        }
+                    });
+                    if (verts.length > 1) {
+                        recordFlat({ type: 'POLYLINE', vertices: verts });
+                    }
+                }
+            } else if (e.type === 'TEXT') {
+                if (e.x != null && e.y != null) {
+                    const p = applyMatrix(new THREE.Vector3(e.x, e.y, 0));
+                    recordFlat({ type: 'TEXT', x: p.x, y: p.y, size: e.r || 10, text: e.text });
+                }
+            } else if (e.type === 'INSERT' || e.type === 'DIMENSION') {
+                if (e.blockName && data.blocks[e.blockName]) {
+                    const blockEntities = data.blocks[e.blockName];
+                    const mat = new THREE.Matrix4();
+                    const position = new THREE.Vector3(e.x || 0, e.y || 0, e.z || 0);
+                    const rotation = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), (e.rotation || 0) * Math.PI / 180);
+                    const scale = new THREE.Vector3(e.xScale || 1, e.yScale || 1, e.zScale || 1);
+                    mat.compose(position, rotation, scale);
+                    if (parentMatrix) mat.premultiply(parentMatrix);
+                    blockEntities.forEach(child => drawEntity(child, mat, layer));
+                }
+            }
+
+            if (points.length > 1) {
+                const geometry = new THREE.BufferGeometry().setFromPoints(points);
+                const line = new THREE.Line(geometry, mat);
+                // Store layer info in UserData for visibility toggle
+                line.userData = { layer: layer };
+                dxfGroup.add(line);
+                count++;
+            }
+        }
+
+        data.entities.forEach(e => drawEntity(e, null, null));
+        logToScreen(`Rendered Objects: ${count}`);
+    }
+
+    // --- Export Simple DXF ---
+    function exportSimpleDXF() {
+        if (flatEntities.length === 0) {
+            alert("No data to export. Load a file first.");
+            return;
+        }
+        
+        let d = "0\nSECTION\n2\nHEADER\n0\nENDSEC\n";
+        d += "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLAYER\n0\nLAYER\n2\n0\n70\n0\n62\n7\n6\nCONTINUOUS\n0\nENDTAB\n0\nENDSEC\n";
+        d += "0\nSECTION\n2\nENTITIES\n";
+        
+        let count = 0;
+        flatEntities.forEach(e => {
+            // Check visibility (simple check against layers map if we updated it, 
+            // or check if layer is 'off'. For now assume all visible layers in flatEntities logic)
+            // We can check layer panel state.
+            const layerName = e.layer || '0';
+            // Find input
+            // Actually buildLayerUI creates checkboxes.
+            // Let's just export visible ones. 
+            // But flatEntities doesn't auto-update visibility prop.
+            // We can check if the Three.js objects are visible, but flatEntities is separate.
+            // Let's just check the global layers map logic if we had one robustly.
+            // Simplification: Export everything that was parsed.
+            
+            if (e.type === 'LINE') {
+                d += `0\nLINE\n8\n${layerName}\n10\n${e.x1}\n20\n${e.y1}\n30\n0\n11\n${e.x2}\n21\n${e.y2}\n31\n0\n`;
+                count++;
+            } else if (e.type === 'CIRCLE') {
+                d += `0\nCIRCLE\n8\n${layerName}\n10\n${e.cx}\n20\n${e.cy}\n30\n0\n40\n${e.r}\n`;
+                count++;
+            } else if (e.type === 'ARC') {
+                d += `0\nARC\n8\n${layerName}\n10\n${e.cx}\n20\n${e.cy}\n30\n0\n40\n${e.r}\n`;
+                d += `50\n${e.startAngle * 180 / Math.PI}\n51\n${e.endAngle * 180 / Math.PI}\n`;
+                count++;
+            } else if (e.type === 'TEXT') {
+                d += `0\nTEXT\n8\n${layerName}\n10\n${e.x}\n20\n${e.y}\n30\n0\n40\n${e.size}\n1\n${e.text}\n`;
+                count++;
+            } else if (e.type === 'POLYLINE') {
+                d += `0\nLWPOLYLINE\n8\n${layerName}\n90\n${e.vertices.length}\n70\n0\n`;
+                e.vertices.forEach(v => {
+                    d += `10\n${v.x}\n20\n${v.y}\n`;
+                });
+                count++;
+            }
+        });
+        
+        d += "0\nENDSEC\n0\nEOF\n";
+        
+        const blob = new Blob([d], { type: 'application/dxf' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `simple_export_${Date.now()}.dxf`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        logToScreen(`Exported ${count} entities.`);
+    }
+
+    function buildLayerUI(layerList) {
+        const container = document.getElementById('layer-list');
+        container.innerHTML = '';
+        const sortedNames = Object.keys(layerList).sort();
+        
+        sortedNames.forEach(name => {
+            const div = document.createElement('div');
+            div.className = 'layer-item';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = true; 
+            cb.dataset.layer = name;
+            cb.onchange = (e) => toggleLayerVisibility(e.target.dataset.layer, e.target.checked);
+            const label = document.createElement('span');
+            label.textContent = name;
+            div.appendChild(cb);
+            div.appendChild(label);
+            container.appendChild(div);
+        });
+    }
+
+    function toggleLayerVisibility(layerName, isVisible) {
+        dxfGroup.traverse(child => {
+            if (child.userData && child.userData.layer === layerName) {
+                child.visible = isVisible;
+            }
+        });
+    }
+
+    function fitCamera() {
+        if (dxfGroup.children.length === 0) return;
+        const box = new THREE.Box3().setFromObject(dxfGroup);
+        const size = new THREE.Vector3(); box.getSize(size);
+        const center = new THREE.Vector3(); box.getCenter(center);
+        
+        if (size.lengthSq() === 0) {
+             controls.target.copy(center);
+             camera.position.set(center.x, center.y, center.z + 100);
+             controls.update();
+             return; 
+        }
+
+        const maxDim = Math.max(size.x, size.y, size.z);
+        let cameraZ = maxDim * 1.5; 
+        camera.near = Math.max(0.1, cameraZ / 100000);
+        camera.far = Math.max(100000, cameraZ * 100);
+        camera.updateProjectionMatrix();
+
+        controls.target.copy(center);
+        camera.position.set(center.x, center.y, center.z + cameraZ);
+        controls.update();
+    }
+</script>
+</body>
+</html>
