@@ -1,1 +1,1 @@
-# dxfv
+DXF ファイルビュアー TexttoCAD用の文字コード変換機能あり
